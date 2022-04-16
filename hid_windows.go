@@ -15,9 +15,13 @@ import "C"
 
 import (
 	"errors"
+	"regexp"
+	"strconv"
 	"syscall"
 	"unsafe"
 )
+
+var regex = regexp.MustCompile("vid_([0-9a-fA-F]{4})&pid_([0-9a-fA-F]{4})")
 
 type winDevice struct {
 	handle syscall.Handle
@@ -149,7 +153,7 @@ func openDevice(info *DeviceInfo, enumerate bool) (*winDevice, error) {
 	}
 }
 
-func getDeviceDetails(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE_INTERFACE_DATA) *DeviceInfo {
+func getPath(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE_INTERFACE_DATA) string {
 	devicePath := getCString(func(buffer unsafe.Pointer, size *C.DWORD) unsafe.Pointer {
 		interfaceDetailData := (*C.SP_DEVICE_INTERFACE_DETAIL_DATA_A)(buffer)
 		if interfaceDetailData != nil {
@@ -162,10 +166,10 @@ func getDeviceDetails(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE
 			return nil
 		}
 	})
-	if devicePath == "" {
-		return nil
-	}
+	return devicePath
+}
 
+func verifyHID(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE_INTERFACE_DATA) bool {
 	// Make sure this device is of Setup Class "HIDClass" and has a driver bound to it.
 	var i C.DWORD
 	var devinfoData C.SP_DEVINFO_DATA
@@ -190,10 +194,19 @@ func getDeviceDetails(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE
 			break
 		}
 	}
+	return isHID
+}
 
-	if !isHID {
+func getDeviceDetails(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE_INTERFACE_DATA) *DeviceInfo {
+	devicePath := getPath(deviceInfoSet, deviceInterfaceData)
+	if devicePath == "" {
 		return nil
 	}
+
+	if !verifyHID(deviceInfoSet, deviceInterfaceData) {
+		return nil
+	}
+
 	d, _ := ByPath(devicePath)
 	return d
 }
@@ -287,4 +300,43 @@ func (di *DeviceInfo) Open() (Device, error) {
 		}
 		return nil, err
 	}
+}
+
+func FastFindDevices(vendor uint16, product uint16) <-chan *DeviceInfo {
+	result := make(chan *DeviceInfo)
+	go func() {
+		var InterfaceClassGuid C.GUID
+		C.HidD_GetHidGuid(&InterfaceClassGuid)
+		deviceInfoSet := C.SetupDiGetClassDevsA(&InterfaceClassGuid, nil, nil, C.DIGCF_PRESENT|C.DIGCF_DEVICEINTERFACE)
+		defer C.SetupDiDestroyDeviceInfoList(deviceInfoSet)
+
+		var deviceIdx C.DWORD = 0
+		var deviceInterfaceData C.SP_DEVICE_INTERFACE_DATA
+		deviceInterfaceData.cbSize = C.DWORD(unsafe.Sizeof(deviceInterfaceData))
+
+		for ; ; deviceIdx++ {
+			res := C.SetupDiEnumDeviceInterfaces(deviceInfoSet, nil, &InterfaceClassGuid, deviceIdx, &deviceInterfaceData)
+			if res == 0 {
+				break
+			}
+
+			if verifyHID(deviceInfoSet, &deviceInterfaceData) {
+				devicePath := getPath(deviceInfoSet, &deviceInterfaceData)
+				matches := regex.FindStringSubmatch(devicePath)
+				if len(matches) == 3 {
+					vid, _ := strconv.ParseUint(matches[1], 16, 16)
+					pid, _ := strconv.ParseUint(matches[2], 16, 16)
+					if uint16(vid) == vendor && uint16(pid) == product {
+						di, _ := ByPath(devicePath)
+						if di != nil {
+							result <- di
+
+						}
+					}
+				}
+			}
+		}
+		close(result)
+	}()
+	return result
 }
